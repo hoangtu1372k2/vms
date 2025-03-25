@@ -3,10 +3,13 @@ package app
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,7 +23,6 @@ import (
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
-	"net/http"
 	"net/http/pprof"
 
 	"github.com/hoangtu1372k2/common-go/auth"
@@ -31,38 +33,29 @@ var (
 	ErrShutdown = fmt.Errorf("application shutdown gracefully")
 )
 
-// srv is the global reference for the HTTP Server.
 var srv *http.Server
-
-// runCtx is a global context used to control shutdown of the application.
 var runCtx context.Context
-
-// runCancel is a global context cancelFunc used to trigger the shutdown of applications.
 var runCancel context.CancelFunc
-
-// cfg is used across the app package to contain configuration.
 var cfg *viper.Viper
-
-// log is used across the app package for logging.
 var log *logrus.Logger
-
-// stats is used across the app package to manage and access system metrics.
 var stats = telemetry.New()
-
-// Khởi tạo RateLimiter
 var limiter *RateLimiter
+
+// Global request counter for rate limiting
+var globalRequestCount uint64
+var globalLimit uint64
+
+// TrustedProxies là danh sách các proxy đáng tin cậy
+var TrustedProxies = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} // Ví dụ, cần cấu hình thực tế
 
 // Run application.
 func Run(c *viper.Viper) error {
 	var err error
 
-	// Create App Context
 	runCtx, runCancel = context.WithCancel(context.Background())
-
-	// Apply config provided by config package global
 	cfg = c
-
 	log = logrus.New()
+
 	if cfg.GetBool("debug") {
 		log.Level = logrus.DebugLevel
 		log.Debug("Enabling Debug Logging")
@@ -77,15 +70,20 @@ func Run(c *viper.Viper) error {
 
 	// Khởi tạo Rate Limiter
 	rateLimitCfg := RateLimitConfig{
-		FixedLimit:   cfg.GetInt("rate_limit_fixed"),   // Ví dụ: 5 request/phút
-		SlidingLimit: cfg.GetInt("rate_limit_sliding"), // Ví dụ: 5 request/phút trượt
-		TokenLimit:   cfg.GetInt("rate_limit_tokens"),  // Ví dụ: 3 token
-		TokenRefill:  10 * time.Second,                 // 100 token mỗi giây
+		FixedLimit:   cfg.GetInt("rate_limit_fixed"),
+		SlidingLimit: cfg.GetInt("rate_limit_sliding"),
+		TokenLimit:   cfg.GetInt("rate_limit_tokens"),
+		TokenRefill:  10 * time.Second,
 		Window:       10 * time.Second,
 	}
 	limiter = NewRateLimiter(rateLimitCfg)
 
-	//Thông tin swagger
+	// Cấu hình global limit từ viper nếu có
+	if cfg.GetInt("global_limit") > 0 {
+		globalLimit = uint64(cfg.GetInt("global_limit"))
+	}
+
+	// Thông tin swagger
 	swagger.SwaggerInfo.Title = "VMS"
 	swagger.SwaggerInfo.Description = "A video management service API."
 	swagger.SwaggerInfo.Version = "1.0"
@@ -97,7 +95,6 @@ func Run(c *viper.Viper) error {
 		swagger.SwaggerInfo.Schemes = []string{"http", "https"}
 	}
 
-	// Setting router
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	router.Use(cors.New(cors.Config{
@@ -113,6 +110,14 @@ func Run(c *viper.Viper) error {
 		MaxAge: 12 * time.Hour,
 	}))
 
+	// Reset global request counter mỗi phút
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			atomic.StoreUint64(&globalRequestCount, 0)
+		}
+	}()
+
 	apiV0 := router.Group(cfg.GetString("service_path"))
 	{
 		var tokenRequired bool = true
@@ -120,10 +125,7 @@ func Run(c *viper.Viper) error {
 			tokenRequired = false
 		}
 
-		// swagger
 		apiV0.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
-
-		// pprof handlers
 		apiV0.GET("/debug/pprof/", gin.WrapH(http.HandlerFunc(pprof.Index)))
 		apiV0.GET("/debug/pprof/cmdline", gin.WrapH(http.HandlerFunc(pprof.Cmdline)))
 		apiV0.GET("/debug/pprof/profile", gin.WrapH(http.HandlerFunc(pprof.Profile)))
@@ -136,16 +138,13 @@ func Run(c *viper.Viper) error {
 		apiV0.GET("/debug/pprof/threadcreate", gin.WrapH(pprof.Handler("threadcreate")))
 		apiV0.GET("/debug/pprof/block", gin.WrapH(pprof.Handler("block")))
 
-		// health check
 		apiV0.GET("/health", handleWrapper(controllers.Health, tokenRequired))
 
-		// Setup the HTTP Server
 		srv = &http.Server{
 			Addr:    cfg.GetString("listen_addr"),
 			Handler: router,
 		}
 
-		// Kick off Graceful Shutdown Go Routine
 		go func() {
 			trap := make(chan os.Signal, 1)
 			signal.Notify(trap, syscall.SIGTERM)
@@ -154,7 +153,6 @@ func Run(c *viper.Viper) error {
 			defer Stop()
 		}()
 
-		// Start HTTP Listener
 		log.Infof("Starting HTTP Listener on %s, service path is %s", cfg.GetString("listen_addr"), cfg.GetString("service_path"))
 		err = srv.ListenAndServe()
 		if err != nil {
@@ -178,15 +176,51 @@ func Stop() {
 	defer runCancel()
 }
 
-// isPProf is a regex that validates if the given path is used for PProf
 var isPProf = regexp.MustCompile(`.*debug\/pprof.*`)
 
-// middleware is used to intercept incoming HTTP calls and apply general functions upon them.
+// Lấy IP đáng tin cậy từ request
+func GetTrustedClientIP(c *gin.Context) string {
+	// Lấy IP từ X-Forwarded-For
+	xff := c.Request.Header.Get("X-Forwarded-For")
+	if xff != "" {
+		ips := strings.Split(xff, ",")
+		for i := len(ips) - 1; i >= 0; i-- {
+			ip := strings.TrimSpace(ips[i])
+			if isTrustedProxy(ip) {
+				continue
+			}
+			fmt.Println("IP X-Forwarded-For : ", ip)
+			return ip
+		}
+	}
+	// Fallback về RemoteAddr nếu không có proxy đáng tin cậy
+	ip, _, _ := net.SplitHostPort(c.Request.RemoteAddr)
+	fmt.Println("IP SplitHostPort : ", ip)
+	return ip
+}
+
+// isTrustedProxy kiểm tra xem IP có thuộc danh sách proxy đáng tin cậy không
+func isTrustedProxy(ip string) bool {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
+	}
+	for _, cidr := range TrustedProxies {
+		_, subnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if subnet.Contains(parsedIP) {
+			return true
+		}
+	}
+	return false
+}
+
 func handleWrapper(n gin.HandlerFunc, tokenRequired bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		now := time.Now()
 
-		// Log cơ bản
 		log.WithFields(logrus.Fields{
 			"method":         c.Request.Method,
 			"remote-addr":    c.Request.RemoteAddr,
@@ -195,7 +229,6 @@ func handleWrapper(n gin.HandlerFunc, tokenRequired bool) gin.HandlerFunc {
 			"content-length": c.Request.ContentLength,
 		}).Debugf("HTTP Request to %s", c.Request.URL)
 
-		// Chặn PProf nếu disable
 		if isPProf.MatchString(c.Request.URL.Path) && !cfg.GetBool("enable_pprof") {
 			log.WithFields(logrus.Fields{
 				"method":         c.Request.Method,
@@ -209,6 +242,18 @@ func handleWrapper(n gin.HandlerFunc, tokenRequired bool) gin.HandlerFunc {
 			return
 		}
 
+		// Kiểm tra global rate limit
+		currentCount := atomic.LoadUint64(&globalRequestCount)
+		log.Warnf("Global rate limit exceeded: %d requests", currentCount)
+		if currentCount >= globalLimit {
+			log.Warnf("Global rate limit exceeded: %d requests", currentCount)
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "Server is under heavy load. Please try again later.",
+			})
+			return
+		}
+		atomic.AddUint64(&globalRequestCount, 1)
+
 		// Xác định userID
 		var userID string
 		if tokenRequired {
@@ -216,19 +261,15 @@ func handleWrapper(n gin.HandlerFunc, tokenRequired bool) gin.HandlerFunc {
 				c.AbortWithStatus(http.StatusUnauthorized)
 				return
 			}
-			userID = auth.GetUserID(c) // Lấy userID từ token JWT
+			userID = auth.GetUserID(c)
 		} else {
-			userID = c.ClientIP() // Fallback về IP nếu không yêu cầu token
+			userID = GetTrustedClientIP(c)
 		}
 
 		// Rate Limiting với Redis
 		if limiter != nil {
 			ctx := c.Request.Context()
-			// Kiểm tra cả 3 thuật toán (hoặc chọn 1 tùy nhu cầu)
 			if !limiter.TokenBucket(ctx, userID) {
-				// || !limiter.SlidingWindow(ctx, userID)
-				// || !limiter.TokenBucket(ctx, userID)
-				// || !limiter.FixedWindow(ctx, userID)
 				log.Warnf("Rate Limit exceeded for user: %s", userID)
 				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 					"error": "Rate limit exceeded. Please try again later.",
@@ -237,7 +278,6 @@ func handleWrapper(n gin.HandlerFunc, tokenRequired bool) gin.HandlerFunc {
 			}
 		}
 
-		// Thực thi handler chính
 		n(c)
 		stats.Srv.WithLabelValues(c.Request.URL.Path).Observe(time.Since(now).Seconds())
 	}

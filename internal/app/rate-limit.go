@@ -68,40 +68,45 @@ func (rl *RateLimiter) SlidingWindow(ctx context.Context, userID string) bool {
 	rl.redisClient.Expire(ctx, key, rl.config.Window)
 	return count <= int64(rl.config.SlidingLimit)
 }
+
 func (rl *RateLimiter) TokenBucket(ctx context.Context, userID string) bool {
 	key := fmt.Sprintf("token_bucket:%s", userID)
 	now := time.Now()
 
+	// Lấy dữ liệu từ Redis
 	data, err := rl.redisClient.HGetAll(ctx, key).Result()
 	if err != nil {
 		log.Errorf("HGetAll failed: %v", err)
 		return false
 	}
 
-	tokens := rl.config.TokenLimit
+	// Khởi tạo tokens
+	tokens := rl.config.TokenLimit // 20
 	lastRefill, _ := time.Parse(time.RFC3339Nano, data["last_refill"])
 	if lastRefill.IsZero() {
 		lastRefill = now
 	} else {
 		elapsed := now.Sub(lastRefill)
-		newTokens := int(elapsed / rl.config.TokenRefill)
+		newTokens := int(elapsed / rl.config.TokenRefill) // 10 giây/token
 		if tokenStr, exists := data["tokens"]; exists {
 			if parsedTokens, err := strconv.Atoi(tokenStr); err == nil {
 				tokens = parsedTokens
 			}
 		}
 		tokens = min(tokens+newTokens, rl.config.TokenLimit)
-		log.Debugf("Tokens: %d, Elapsed: %v, NewTokens: %d", tokens, elapsed, newTokens)
+		log.Debugf("Before - User: %s, Tokens: %d, Elapsed: %v, NewTokens: %d", userID, tokens, elapsed, newTokens)
 	}
 
+	// Kiểm tra token
 	if tokens < 1 {
 		log.Debugf("No tokens left for %s", userID)
 		return false
 	}
 
-	// Sử dụng HMSET thay cho HSET để tương thích với Redis 3.0, lớm hơn 4.0 thì dùng hset khác
+	// Giảm token và ghi vào Redis
+	tokens--
 	err = rl.redisClient.HMSet(ctx, key,
-		"tokens", strconv.Itoa(tokens-1),
+		"tokens", strconv.Itoa(tokens),
 		"last_refill", now.Format(time.RFC3339Nano),
 	).Err()
 	if err != nil {
@@ -109,7 +114,7 @@ func (rl *RateLimiter) TokenBucket(ctx context.Context, userID string) bool {
 		return false
 	}
 
-	log.Debugf("Request allowed, tokens left: %d", tokens-1)
+	log.Debugf("Allowed - User: %s, Tokens left: %d", userID, tokens)
 	return true
 }
 
