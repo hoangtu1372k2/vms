@@ -1,0 +1,22 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "contact": {}
+    },
+    "paths": {
+        "/health": {
+            "get": {
+                "description": "Use this for liveness probes or any other checks which only validate if the services is running.",
+                "tags": [
+                    "healthcheck"
+                ],
+                "summary": "Health is used to handle HTTP Health requests to this service.",
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,14 @@
+info:
+  contact: {}
+paths:
+  /health:
+    get:
+      description: Use this for liveness probes or any other checks which only validate
+        if the services is running.
+      responses:
+        "200":
+          description: OK
+      summary: Health is used to handle HTTP Health requests to this service.
+      tags:
+      - healthcheck
+swagger: "2.0"
