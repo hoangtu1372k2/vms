@@ -174,23 +174,20 @@ func Run(c *viper.Viper) error {
 
 // Stop is used to gracefully shutdown the server with a timeout.
 func Stop() {
-	// Tạo context với timeout 5 giây
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Shutdown server với timeout
+	runCancel() // Hủy runCtx trước để báo hiệu cho các goroutine dừng
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Errorf("Failed to shutdown HTTP server gracefully: %s", err)
-		// Nếu shutdown thất bại, đóng server ngay lập tức
 		if err := srv.Close(); err != nil {
 			log.Errorf("Failed to force close HTTP server: %s", err)
 		}
 	} else {
 		log.Info("HTTP server shutdown gracefully")
 	}
-
-	// Hủy runCtx để dừng các goroutine liên quan
-	runCancel()
+	// Chờ một khoảng thời gian ngắn để các goroutine kết thúc
+	time.Sleep(100 * time.Millisecond)
 }
 
 var isPProf = regexp.MustCompile(`.*debug\/pprof.*`)
