@@ -238,20 +238,30 @@ func handleWrapper(n gin.HandlerFunc, tokenRequired bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		now := time.Now()
 
+		// Lọc header nhạy cảm
+		safeHeaders := make(http.Header)
+		for k, v := range c.Request.Header {
+			if k != "Authorization" && k != "Cookie" {
+				safeHeaders[k] = v
+			}
+		}
+
+		// Log request với header đã lọc
 		log.WithFields(logrus.Fields{
 			"method":         c.Request.Method,
 			"remote-addr":    c.Request.RemoteAddr,
 			"http-protocol":  c.Request.Proto,
-			"headers":        c.Request.Header,
+			"headers":        safeHeaders, // Sử dụng safeHeaders thay vì c.Request.Header
 			"content-length": c.Request.ContentLength,
 		}).Debugf("HTTP Request to %s", c.Request.URL)
 
+		// Kiểm tra PProf
 		if isPProf.MatchString(c.Request.URL.Path) && !cfg.GetBool("enable_pprof") {
 			log.WithFields(logrus.Fields{
 				"method":         c.Request.Method,
 				"remote-addr":    c.Request.RemoteAddr,
 				"http-protocol":  c.Request.Proto,
-				"headers":        c.Request.Header,
+				"headers":        safeHeaders,
 				"content-length": c.Request.ContentLength,
 			}).Debugf("Request to PProf Address failed, PProf disabled")
 			c.AbortWithStatus(http.StatusForbidden)
@@ -261,7 +271,6 @@ func handleWrapper(n gin.HandlerFunc, tokenRequired bool) gin.HandlerFunc {
 
 		// Kiểm tra global rate limit
 		currentCount := atomic.LoadUint64(&globalRequestCount)
-		log.Warnf("Global rate limit exceeded: %d requests", currentCount)
 		if currentCount >= globalLimit {
 			log.Warnf("Global rate limit exceeded: %d requests", currentCount)
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
