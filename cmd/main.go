@@ -26,7 +26,7 @@ func main() {
 	cfg.SetDefault("redis_host", "localhost")
 	cfg.SetDefault("redis_post", "6379")
 
-	cfg.SetDefault("global_limit", "20")
+	cfg.SetDefault("global_limit", "5")
 	cfg.SetDefault("rate_limit_fixed", "5")
 	cfg.SetDefault("rate_limit_sliding", "5")
 	cfg.SetDefault("rate_limit_tokens", "15")

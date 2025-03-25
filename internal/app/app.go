@@ -41,12 +41,10 @@ var log *logrus.Logger
 var stats = telemetry.New()
 var limiter *RateLimiter
 
-// Global request counter for rate limiting
 var globalRequestCount uint64
 var globalLimit uint64
 
-// TrustedProxies là danh sách các proxy đáng tin cậy
-var TrustedProxies = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} // Ví dụ, cần cấu hình thực tế
+var TrustedProxies = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 
 // Run application.
 func Run(c *viper.Viper) error {
@@ -78,12 +76,11 @@ func Run(c *viper.Viper) error {
 	}
 	limiter = NewRateLimiter(rateLimitCfg)
 
-	// Cấu hình global limit từ viper nếu có
 	if cfg.GetInt("global_limit") > 0 {
 		globalLimit = uint64(cfg.GetInt("global_limit"))
 	}
 
-	// Thông tin swagger
+	// Cấu hình Swagger
 	swagger.SwaggerInfo.Title = "VMS"
 	swagger.SwaggerInfo.Description = "A video management service API."
 	swagger.SwaggerInfo.Version = "1.0"
@@ -110,11 +107,18 @@ func Run(c *viper.Viper) error {
 		MaxAge: 12 * time.Hour,
 	}))
 
-	// Reset global request counter mỗi phút
+	// Reset global request counter mỗi phút, kiểm soát bằng runCtx
 	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
 		for {
-			time.Sleep(time.Minute)
-			atomic.StoreUint64(&globalRequestCount, 0)
+			select {
+			case <-runCtx.Done():
+				log.Info("Stopping global request counter reset goroutine")
+				return
+			case <-ticker.C:
+				atomic.StoreUint64(&globalRequestCount, 0)
+			}
 		}
 	}()
 
@@ -145,12 +149,13 @@ func Run(c *viper.Viper) error {
 			Handler: router,
 		}
 
+		// Xử lý tín hiệu shutdown
 		go func() {
 			trap := make(chan os.Signal, 1)
-			signal.Notify(trap, syscall.SIGTERM)
+			signal.Notify(trap, syscall.SIGTERM, syscall.SIGINT)
 			s := <-trap
 			log.Infof("Received shutdown signal %s", s)
-			defer Stop()
+			Stop()
 		}()
 
 		log.Infof("Starting HTTP Listener on %s, service path is %s", cfg.GetString("listen_addr"), cfg.GetString("service_path"))
@@ -167,13 +172,25 @@ func Run(c *viper.Viper) error {
 	}
 }
 
-// Stop is used to gracefully shutdown the server.
+// Stop is used to gracefully shutdown the server with a timeout.
 func Stop() {
-	err := srv.Shutdown(context.Background())
-	if err != nil {
-		log.Errorf("Unexpected error while shutting down HTTP server - %s", err)
+	// Tạo context với timeout 5 giây
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Shutdown server với timeout
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Errorf("Failed to shutdown HTTP server gracefully: %s", err)
+		// Nếu shutdown thất bại, đóng server ngay lập tức
+		if err := srv.Close(); err != nil {
+			log.Errorf("Failed to force close HTTP server: %s", err)
+		}
+	} else {
+		log.Info("HTTP server shutdown gracefully")
 	}
-	defer runCancel()
+
+	// Hủy runCtx để dừng các goroutine liên quan
+	runCancel()
 }
 
 var isPProf = regexp.MustCompile(`.*debug\/pprof.*`)
